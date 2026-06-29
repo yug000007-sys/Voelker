@@ -42,3 +42,7 @@ Notes:
 - Uses Voelker PDF attachment inside each MSG.
 - Address is taken from Sold To, not Ship To.
 - Brand is populated as Voelker Controls.
+
+
+## v5 fix
+- Cleans Sold To address prefixes glued by PDF extraction, e.g. `div of Pinnpack 1151 Pacific Ave.` -> `1151 Pacific Ave.` and `a Lincoln Electric Company 407 South Main St` -> `407 South Main St`.

@@ -315,6 +315,26 @@ def split_auth_salesperson(value: str) -> Tuple[str, str]:
     return "", value
 
 
+
+def normalize_voelker_address(addr: str) -> str:
+    """Remove customer/division text that pypdf sometimes glues before the real Sold To street line."""
+    addr = clean_text(addr)
+    if not addr:
+        return ""
+    # Keep from PO Box if present.
+    m = re.search(r"\bP\.?\s*O\.?\s*Box\s+\d+\b.*", addr, re.I)
+    if m:
+        addr = m.group(0)
+    else:
+        # Otherwise keep from the first street number. This removes prefixes like
+        # "div of Pinnpack" or "a Lincoln Electric Company" that appear before the address.
+        m = re.search(r"\b\d{1,6}\s+.+", addr)
+        if m:
+            addr = m.group(0)
+    addr = re.sub(r"\bP\.?\s*O\.?\s*Box\b", "PO Box", addr, flags=re.I)
+    addr = re.sub(r"\s+", " ", addr).strip(" ,")
+    return addr
+
 def extract_sold_to(lines: List[str], company: str) -> Dict[str, str]:
     """Return first/Sold To address block, not Ship To. Handles multi-line addresses."""
     out = {"Company": company, "Address": "", "City": "", "State": "", "ZipCode": "", "Country": "USA"}
@@ -341,7 +361,7 @@ def extract_sold_to(lines: List[str], company: str) -> Dict[str, str]:
             addr_lines = block[:j]
             # Manual Voelker output keeps the main mailing/street line. Include Suite/Unit lines, skip ATTN/AP notes.
             clean_addr = [x for x in addr_lines if not re.search(r"^(ATTN|ACCOUNTS PAYABLE|DOCK DOOR|PLANT)\b", x, re.I)]
-            out["Address"] = clean_text(" ".join(clean_addr))
+            out["Address"] = normalize_voelker_address(" ".join(clean_addr))
             out["City"], out["State"], out["ZipCode"], out["Country"] = city, state, z, country
             break
     return out
