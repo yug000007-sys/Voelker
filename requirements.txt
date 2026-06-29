@@ -1,0 +1,6 @@
+streamlit
+pandas
+openpyxl
+extract-msg
+beautifulsoup4
+lxml
