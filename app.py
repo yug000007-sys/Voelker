@@ -421,6 +421,93 @@ def find_after_label(lines: List[str], label: str) -> str:
     return ""
 
 
+
+def extract_created_by(lines: List[str], joined: str, quote_number: str = "") -> str:
+    """Extract Voelker Quoted By / Created_By robustly.
+
+    Voelker PDFs are inconsistent after text extraction. Sometimes the row is:
+      01/133795 2401334280 Jessica Halter UPS GROUND
+    and sometimes the shipping method is unusual, so a ship-via anchored regex
+    misses the name. This function first looks on the quote-number row and
+    captures the first human-name pattern after optional PO/reference tokens.
+    """
+    bad_words = {
+        "UPS", "FEDEX", "GROUND", "BEST", "WAY", "OUR", "TRUCK", "FREIGHT",
+        "CUSTOMER", "PICK", "PICKUP", "PICKED", "CALL", "PPD", "COL", "PREPAID",
+        "COLLECT", "DAYTON", "CINCINNATI", "SPECIAL", "SEE", "BELOW", "NET", "CASH",
+        "TERMS", "QUOTE", "QUOTED", "BY", "SHIP", "VIA", "SHIPPED", "FROM"
+    }
+
+    def valid_name(candidate: str) -> bool:
+        candidate = clean_text(candidate)
+        if not candidate:
+            return False
+        parts = candidate.split()
+        if len(parts) < 2 or len(parts) > 3:
+            return False
+        if any(p.upper().strip(".,-/") in bad_words for p in parts):
+            return False
+        if any(re.search(r"\d", p) for p in parts):
+            return False
+        return True
+
+    def first_name_in_text(txt: str) -> str:
+        txt = clean_text(txt)
+        # Known names first avoids accidentally taking title-cased ship-via text.
+        for nm in [
+            "Jessica Halter", "Joshua Toler", "Nicole Epps", "Loghan Keefer",
+            "Brian Floyd", "Rob McCullough", "Bryan Steller", "Russell Hahn",
+            "Carlos De Los Santos", "Chris Dillon", "Scott Durbin", "Sean Kelly",
+            "Matt Rasnic", "David Voelker", "Todd Voelker", "Dave Waldbillig",
+            "Kody Robertson", "JC Gentile", "Chris Lasita", "Adam Frost"
+        ]:
+            if re.search(r"\b" + re.escape(nm) + r"\b", txt, re.I):
+                return nm
+        # Generic person name after optional reference token(s).
+        for m in re.finditer(r"\b([A-Z][a-zA-Z'\-]+(?:\s+(?:De|Del|De\s+Los|Mc)?[A-Z][a-zA-Z'\-]+){1,2})\b", txt):
+            cand = clean_text(m.group(1))
+            if valid_name(cand):
+                return cand
+        return ""
+
+    quote_pat = r"\b\d{2}/\d{5,}(?:-[A-Z0-9]+)?\b"
+    if quote_number:
+        q_digits = re.sub(r"^\d{2}/", "", quote_number)
+        quote_pat = r"\b(?:\d{2}/)?" + re.escape(q_digits) + r"(?:-[A-Z0-9]+)?\b"
+
+    # 1) Same line as quote number.
+    for line in lines:
+        if re.search(quote_pat, line, re.I):
+            tail = re.sub(r"^.*?" + quote_pat, "", line, flags=re.I).strip()
+            # Drop optional PO/reference tokens before the quoted-by name.
+            tail = re.sub(r"^(?:[A-Z0-9_.\-/]{3,}\s+){0,3}", "", tail).strip()
+            nm = first_name_in_text(tail) or first_name_in_text(line)
+            if nm:
+                return nm
+
+    # 2) Quote number can be on one line and the remaining header on the next few lines.
+    for i, line in enumerate(lines):
+        if re.search(quote_pat, line, re.I):
+            lookahead = " ".join(lines[i + 1:i + 6])
+            nm = first_name_in_text(lookahead)
+            if nm:
+                return nm
+
+    # 3) Label-based fallback.
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"Quoted By", line, re.I):
+            lookahead = " ".join(lines[i + 1:i + 10])
+            nm = first_name_in_text(lookahead)
+            if nm:
+                return nm
+
+    # 4) Last chance across the joined PDF text near the quote number.
+    m = re.search(quote_pat + r"(.{0,180})", joined, re.I | re.S)
+    if m:
+        return first_name_in_text(m.group(1))
+    return ""
+
+
 def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
     text = clean_text(pdf_text)
     lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
@@ -459,18 +546,9 @@ def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
         d["CustomerNumber"] = m.group(4)
 
     # Created_By / Quoted By is on the second header data line.
-    # Format examples:
-    #   01/133800-R01 Rob McCullough UPS GROUND ...
-    #   01/133795 2401334280 Jessica Halter UPS GROUND ...
-    #   01/133775 1008523 Jessica Halter UPS GROUND ...
-    # Earlier versions missed the last two because a PO/reference number appears
-    # between QuoteNumber and Quoted By. Allow an optional PO/reference token.
-    m = re.search(
-        r"\b\d{2}/\d{5,}(?:-[A-Z0-9]+)?(?:\s+[A-Z0-9_.\-/]+)?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\s+(?:UPS|FEDEX|BEST|OUR|CUSTOMER|PICK|PPD|COL|WILL|TRUCK|GROUND|FREIGHT)\b",
-        joined,
-    )
-    if m:
-        d["Created_By"] = clean_text(m.group(1))
+    # Use the robust extractor because Voelker PDFs may include PO/reference
+    # numbers and variable ship-via text after QuoteNumber.
+    d["Created_By"] = extract_created_by(lines, joined, d.get("QuoteNumber", ""))
 
     # Fallbacks for alternate text extraction order.
     d["ReferralManager"] = d["ReferralManager"] or find_after_label(lines, r"Salesperson")
