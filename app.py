@@ -413,7 +413,17 @@ def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
         # The manual template leaves FirstName/LastName blank, but keep the authorization name available only when user chooses to map it later.
         d["CustomerNumber"] = m.group(4)
 
-    m = re.search(r"\b\d{2}/\d{5,}(?:-[A-Z0-9]+)?\s+([A-Za-z]+\s+[A-Za-z]+)", joined)
+    # Created_By / Quoted By is on the second header data line.
+    # Format examples:
+    #   01/133800-R01 Rob McCullough UPS GROUND ...
+    #   01/133795 2401334280 Jessica Halter UPS GROUND ...
+    #   01/133775 1008523 Jessica Halter UPS GROUND ...
+    # Earlier versions missed the last two because a PO/reference number appears
+    # between QuoteNumber and Quoted By. Allow an optional PO/reference token.
+    m = re.search(
+        r"\b\d{2}/\d{5,}(?:-[A-Z0-9]+)?(?:\s+[A-Z0-9_.\-/]+)?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\s+(?:UPS|FEDEX|BEST|OUR|CUSTOMER|PICK|PPD|COL|WILL|TRUCK|GROUND|FREIGHT)\b",
+        joined,
+    )
     if m:
         d["Created_By"] = clean_text(m.group(1))
 

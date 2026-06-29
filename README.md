@@ -46,3 +46,7 @@ Notes:
 
 ## v5 fix
 - Cleans Sold To address prefixes glued by PDF extraction, e.g. `div of Pinnpack 1151 Pacific Ave.` -> `1151 Pacific Ave.` and `a Lincoln Electric Company 407 South Main St` -> `407 South Main St`.
+
+
+## v6 fix
+- Fixed Created_By when Voelker prints a PO/reference number between QuoteNumber and Quoted By, e.g. `01/133795 2401334280 Jessica Halter ...`.
