@@ -44,12 +44,56 @@ STATE_NAME_TO_ABBR = {
     "VERMONT":"VT","VIRGINIA":"VA","WASHINGTON":"WA","WEST VIRGINIA":"WV","WISCONSIN":"WI","WYOMING":"WY"
 }
 REFERRAL_EMAILS = {
-    "Adam Frost": "frosa00@voelker-controls.com",
     "Carlos De Los Santos": "deloc00@voelker-controls.com",
-    "Bryan Steller": "Stelb00@Voelker-Controls.Com",
+    "Chris Dillon": "dillc00@voelker-controls.com",
+    "Scott Durbin": "durbs00@voelker-controls.com",
+    "Brian Floyd": "floyb00@voelker-controls.com",
+    "Sean Kelly": "kells00@voelker-controls.com",
+    "Rob McCullough": "mccur00@voelker-controls.com",
+    "Matt Rasnic": "rasnm00@voelker-controls.com",
+    "David Voelker": "voeld00@voelker-controls.com",
+    "Todd Voelker": "voelt00@voelker-controls.com",
+    "Dave Waldbillig": "waldd00@voelker-controls.com",
+    "Kody Robertson": "robek00@voelker-controls.com",
+    "DAYTON": "floyb00@voelker-controls.com",
+    "CINCINNATI": "floyb00@voelker-controls.com",
+    "JC Gentile": "gentj00@voelker-controls.com",
     "Russell Hahn": "hahnr00@voelker-controls.com",
+    "Chris Lasita": "lasic00@voelker-controls.com",
+    "Adam Frost": "frosa00@voelker-controls.com",
+    "Bryan Steller": "stelb00@voelker-controls.com",
 }
-KNOWN_SALESPEOPLE = sorted(REFERRAL_EMAILS.keys() | {"Rob McCullough", "Sean Kelly"}, key=len, reverse=True)
+KNOWN_SALESPEOPLE = sorted(REFERRAL_EMAILS.keys(), key=len, reverse=True)
+
+
+def get_referral_email(referral_manager: str) -> str:
+    """Return referral email from Streamlit secrets first, then local fallback.
+
+    For public GitHub repos, put this mapping in Streamlit Cloud Secrets instead of hardcoding.
+    The fallback is included only so local/offline extraction still produces results.
+    """
+    name = clean_text(referral_manager)
+    if not name:
+        return ""
+
+    # 1) Preferred/private source: Streamlit secrets.
+    try:
+        secret_map = st.secrets.get("referral_email", {})
+        if secret_map:
+            if name in secret_map:
+                return str(secret_map[name]).strip()
+            # case-insensitive fallback
+            lookup = {str(k).strip().lower(): str(v).strip() for k, v in dict(secret_map).items()}
+            if name.lower() in lookup:
+                return lookup[name.lower()]
+    except Exception:
+        pass
+
+    # 2) Local/offline fallback.
+    if name in REFERRAL_EMAILS:
+        return REFERRAL_EMAILS[name]
+    lookup = {k.lower(): v for k, v in REFERRAL_EMAILS.items()}
+    return lookup.get(name.lower(), "")
 
 # ------------------------- Basic helpers -------------------------
 
@@ -440,7 +484,7 @@ def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
             d[key] = sold[key]
 
     # ReferralEmail is not printed on the quote PDF; populate the known Voelker mappings used in the manual template.
-    d["ReferralEmail"] = REFERRAL_EMAILS.get(d.get("ReferralManager", ""), "")
+    d["ReferralEmail"] = get_referral_email(d.get("ReferralManager", ""))
 
     return {k: clean_text(v) for k, v in d.items()}
 
