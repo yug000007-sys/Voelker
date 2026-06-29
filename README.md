@@ -1,16 +1,17 @@
-# Voelker Quote Extractor v8
+# Voelker Quote Extractor v9
 
-Updates in v8:
-- Download output as one ZIP containing the completed Excel and renamed quote PDFs.
-- Renamed PDF format uses the PDF column value, for example `VOELKER_133795.pdf`.
-- Privacy-focused processing: uploaded MSG files, generated Excel, and PDFs are processed in memory only. Temporary MSG files used by the parser are deleted immediately. No output files are saved in the app folder.
-- Download button clears generated rows/ZIP from Streamlit session memory on click so the page returns to upload mode on the next rerun.
+Updates:
+- Upload only `.msg` files; no `Volkr.xlsx` upload needed.
+- Built-in Voelker output headers are used automatically.
+- Download output as ZIP containing Excel + renamed quote PDFs.
+- Added **Clear uploaded files / reset** button.
+- Uploaded MSG files, extracted Excel, and renamed PDFs are processed in memory only.
+- Temporary MSG parser files are deleted immediately.
 
-## Run locally
+Run:
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Streamlit Cloud secrets
-Keep real ReferralManager emails in Streamlit Cloud Secrets or local `.streamlit/secrets.toml`. Do not commit `secrets.toml` to GitHub.
+For Streamlit Cloud privacy, keep referral email mapping in Streamlit Secrets where possible.

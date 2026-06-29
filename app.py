@@ -22,7 +22,7 @@ except Exception:
 
 st.set_page_config(page_title="Voelker Quote Extractor", layout="wide")
 st.title("Voelker Quote Extractor")
-st.caption("Upload Voelker .msg quote emails + Volkr.xlsx template. Extracts quote data from the attached PDF inside each MSG. Default output is one row per quote to match the manual Voelker template. No API required. Output ZIP contains Excel + renamed PDFs; no files are permanently stored.")
+st.caption("Upload Voelker .msg quote emails only. Extracts quote data from the attached PDF inside each MSG. Output ZIP contains Excel + renamed PDFs. No API required; no files are permanently stored.")
 
 TEMPLATE_COLUMNS = [
     "ReferralManager", "ReferralEmail", "QuoteNumber", "QuoteDate", "Company",
@@ -764,26 +764,16 @@ def parse_one_uploaded_msg(uploaded_file, output_mode: str = "summary") -> Tuple
     return all_rows, renamed_pdfs
 
 
-def write_output(template_file, rows: List[Dict[str, str]]) -> bytes:
+def write_output(rows: List[Dict[str, str]]) -> bytes:
+    """Create Excel output using the built-in Voelker template columns.
+
+    No template upload is required; no file is written to disk.
+    """
     df_new = pd.DataFrame(rows)
     for col in TEMPLATE_COLUMNS:
         if col not in df_new.columns:
             df_new[col] = ""
     df_new = df_new[TEMPLATE_COLUMNS]
-
-    if template_file is not None:
-        try:
-            base = pd.read_excel(io.BytesIO(template_file.getvalue()), dtype=str)
-            columns = list(base.columns) if len(base.columns) else TEMPLATE_COLUMNS
-        except Exception:
-            columns = TEMPLATE_COLUMNS
-    else:
-        columns = TEMPLATE_COLUMNS
-
-    for col in columns:
-        if col not in df_new.columns:
-            df_new[col] = ""
-    df_new = df_new[columns]
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -796,7 +786,6 @@ def write_output(template_file, rows: List[Dict[str, str]]) -> bytes:
             max_len = max(len(str(c.value or "")) for c in col_cells[:100])
             ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 10), 42)
     return out.getvalue()
-
 
 
 def build_zip_package(excel_bytes: bytes, pdf_files: List[Tuple[str, bytes]]) -> bytes:
@@ -825,20 +814,35 @@ def build_zip_package(excel_bytes: bytes, pdf_files: List[Tuple[str, bytes]]) ->
 
 
 def clear_session_after_download():
-    """Clear processed output from Streamlit session after the download click.
+    """Clear processed output and reset the uploader key.
 
-    Uploaded MSG/template bytes are never written to project storage by this app.
-    This removes the generated preview/ZIP from session memory on the next rerun.
+    Uploaded MSG bytes are never written to project storage by this app.
+    This removes generated preview/ZIP from session memory and refreshes the upload widget on rerun.
     """
     for key in ["voelker_rows", "voelker_zip", "voelker_errors", "voelker_pdf_count"]:
-        if key in st.session_state:
-            del st.session_state[key]
+        st.session_state.pop(key, None)
+    st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
+
+
+def reset_app_now():
+    clear_session_after_download()
+    st.rerun()
 
 # ------------------------- UI -------------------------
 with st.sidebar:
     st.header("Upload")
-    msg_files = st.file_uploader("Voelker .msg files", type=["msg"], accept_multiple_files=True)
-    template_file = st.file_uploader("Volkr.xlsx template", type=["xlsx"])
+    if "uploader_key" not in st.session_state:
+        st.session_state["uploader_key"] = 0
+
+    msg_files = st.file_uploader(
+        "Voelker .msg files",
+        type=["msg"],
+        accept_multiple_files=True,
+        key=f"msg_uploader_{st.session_state['uploader_key']}",
+    )
+
+    st.button("Clear uploaded files / reset", on_click=reset_app_now)
+
     output_mode = st.radio(
         "Output style",
         ["summary", "line_items"],
@@ -865,7 +869,7 @@ if msg_files:
             progress.progress(i / len(msg_files))
 
         if all_rows:
-            output = write_output(template_file, all_rows)
+            output = write_output(all_rows)
             zip_bytes = build_zip_package(output, all_pdfs)
             st.session_state["voelker_rows"] = all_rows
             st.session_state["voelker_zip"] = zip_bytes
@@ -887,7 +891,7 @@ if "voelker_rows" in st.session_state:
         mime="application/zip",
         on_click=clear_session_after_download,
     )
-    st.caption("Privacy: uploaded MSGs, extracted Excel, and PDFs are handled in memory only. Temporary MSG parser files are deleted immediately. The generated ZIP is removed from Streamlit session memory after you click download; no output files are saved in the app folder.")
+    st.caption("Privacy: uploaded MSGs, extracted Excel, and PDFs are handled in memory only. Temporary MSG parser files are deleted immediately. The generated ZIP is removed from Streamlit session memory after you click download/reset; no output files are saved in the app folder.")
 
 if st.session_state.get("voelker_errors"):
     st.warning("Files needing review:")
