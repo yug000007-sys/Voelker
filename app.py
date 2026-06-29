@@ -1,13 +1,18 @@
 import io
 import os
 import re
+import struct
 import tempfile
 from datetime import datetime
 from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
-from bs4 import BeautifulSoup
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
 
 try:
     import extract_msg
@@ -16,7 +21,7 @@ except Exception:
 
 st.set_page_config(page_title="Voelker Quote Extractor", layout="wide")
 st.title("Voelker Quote Extractor")
-st.caption("Upload Voelker .msg quote emails + Volkr.xlsx template. No API required.")
+st.caption("Upload Voelker .msg quote emails + Volkr.xlsx template. Extracts quote data from the attached PDF inside each MSG. No API required.")
 
 TEMPLATE_COLUMNS = [
     "ReferralManager", "ReferralEmail", "QuoteNumber", "QuoteDate", "Company",
@@ -29,18 +34,20 @@ TEMPLATE_COLUMNS = [
 
 STATE_RE = r"AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY"
 
+# ------------------------- Basic helpers -------------------------
 
 def clean_text(value: str) -> str:
     if value is None:
         return ""
-    value = str(value).replace("\xa0", " ")
+    value = str(value).replace("\xa0", " ").replace("\r", "\n")
     value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n[ \t]+", "\n", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
 
 
 def money_to_float(value: str):
-    if not value:
+    if value is None or value == "":
         return ""
     value = re.sub(r"[^0-9.\-]", "", str(value))
     if value in ("", ".", "-", "-."):
@@ -52,7 +59,7 @@ def money_to_float(value: str):
 
 
 def qty_to_number(value: str):
-    if not value:
+    if value is None or value == "":
         return ""
     value = re.sub(r"[^0-9.\-]", "", str(value))
     if value in ("", ".", "-", "-."):
@@ -62,49 +69,6 @@ def qty_to_number(value: str):
         return int(num) if num.is_integer() else num
     except Exception:
         return ""
-
-
-def read_msg(uploaded_file) -> Tuple[str, str, str, List[str]]:
-    """Return subject, body text, html, attachment filenames."""
-    if extract_msg is None:
-        raise RuntimeError("extract-msg is not installed. Check requirements.txt on Streamlit Cloud.")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".msg") as tmp:
-        tmp.write(uploaded_file.getvalue())
-        msg_path = tmp.name
-
-    try:
-        msg = extract_msg.Message(msg_path)
-        subject = clean_text(getattr(msg, "subject", "") or uploaded_file.name)
-        body = clean_text(getattr(msg, "body", "") or "")
-        html = getattr(msg, "htmlBody", None) or getattr(msg, "html", None) or ""
-        if isinstance(html, bytes):
-            html = html.decode("utf-8", errors="ignore")
-        attachments = []
-        for att in getattr(msg, "attachments", []) or []:
-            name = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or ""
-            if name:
-                attachments.append(name)
-        return subject, body, html, attachments
-    finally:
-        try:
-            os.remove(msg_path)
-        except Exception:
-            pass
-
-
-def html_to_text(html: str) -> str:
-    if not html:
-        return ""
-    soup = BeautifulSoup(html, "lxml")
-    for br in soup.find_all(["br", "p", "tr"]):
-        br.append("\n")
-    return clean_text(soup.get_text(" "))
-
-
-def get_regex(pattern: str, text: str, flags=re.I) -> str:
-    m = re.search(pattern, text, flags)
-    return clean_text(m.group(1)) if m else ""
 
 
 def split_name(name: str) -> Tuple[str, str]:
@@ -117,6 +81,191 @@ def split_name(name: str) -> Tuple[str, str]:
     return parts[0], " ".join(parts[1:])
 
 
+def normalize_us_phone(value: str) -> str:
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    return clean_text(value)
+
+
+def get_regex(pattern: str, text: str, flags=re.I) -> str:
+    m = re.search(pattern, text, flags)
+    return clean_text(m.group(1)) if m else ""
+
+# ------------------------- Pure Python MSG/OLE fallback -------------------------
+# This extracts MSG body streams and attachment binary streams even if extract-msg is unavailable.
+
+FREE = 0xFFFFFFFF
+END = 0xFFFFFFFE
+
+class CFB:
+    def __init__(self, data: bytes):
+        self.data = data
+        h = data[:512]
+        if h[:8] != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+            raise ValueError("Not an Outlook MSG/OLE file")
+        self.sector_size = 1 << struct.unpack_from("<H", h, 30)[0]
+        self.mini_sector_size = 1 << struct.unpack_from("<H", h, 32)[0]
+        self.first_dir = struct.unpack_from("<I", h, 48)[0]
+        self.mini_cutoff = struct.unpack_from("<I", h, 56)[0]
+        self.first_mini_fat = struct.unpack_from("<I", h, 60)[0]
+        self.num_mini_fat = struct.unpack_from("<I", h, 64)[0]
+        difat = list(struct.unpack_from("<109I", h, 76))
+        self.fat = []
+        for sid in difat:
+            if sid in (FREE, END):
+                continue
+            sec = self.sector(sid)
+            self.fat.extend(struct.unpack("<%dI" % (len(sec) // 4), sec))
+        self.dirs = []
+        self._load_dirs()
+        root = self.dirs[0]
+        self.mini_stream = self._read_big_stream(root["start"], root["size"])
+        self.minifat = []
+        if self.first_mini_fat not in (FREE, END):
+            b = self._read_big_stream(self.first_mini_fat, self.num_mini_fat * self.sector_size)
+            self.minifat = list(struct.unpack("<%dI" % (len(b) // 4), b)) if b else []
+
+    def sector(self, sid: int) -> bytes:
+        off = 512 + sid * self.sector_size
+        return self.data[off:off + self.sector_size]
+
+    def chain(self, start: int, fat=None) -> List[int]:
+        fat = fat or self.fat
+        out, seen, sid = [], set(), start
+        while sid not in (FREE, END) and sid < len(fat) and sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+            sid = fat[sid]
+        return out
+
+    def _read_big_stream(self, start: int, size: int = None) -> bytes:
+        b = b"".join(self.sector(s) for s in self.chain(start))
+        return b[:size] if size is not None else b
+
+    def _read_mini_stream(self, start: int, size: int) -> bytes:
+        parts = []
+        for sid in self.chain(start, self.minifat):
+            off = sid * self.mini_sector_size
+            parts.append(self.mini_stream[off:off + self.mini_sector_size])
+        return b"".join(parts)[:size]
+
+    def _load_dirs(self):
+        b = self._read_big_stream(self.first_dir, None)
+        for i in range(len(b) // 128):
+            ent = b[i * 128:(i + 1) * 128]
+            name_len = struct.unpack_from("<H", ent, 64)[0]
+            raw = ent[:max(0, name_len - 2)]
+            name = raw.decode("utf-16le", "ignore") if raw else ""
+            typ = ent[66]
+            left, right, child = struct.unpack_from("<III", ent, 68)
+            start = struct.unpack_from("<I", ent, 116)[0]
+            size = struct.unpack_from("<Q", ent, 120)[0]
+            self.dirs.append({"idx": i, "name": name, "type": typ, "left": left, "right": right, "child": child, "start": start, "size": size})
+
+    def walk(self, idx=0, prefix=""):
+        def rec(i, p):
+            if i == FREE or i >= len(self.dirs):
+                return
+            e = self.dirs[i]
+            yield from rec(e["left"], p)
+            path = p + "/" + e["name"] if p else e["name"]
+            yield i, path, e
+            if e["child"] != FREE:
+                yield from rec(e["child"], path)
+            yield from rec(e["right"], p)
+        if self.dirs[idx]["child"] != FREE:
+            yield from rec(self.dirs[idx]["child"], prefix or self.dirs[idx]["name"])
+
+    def read_stream(self, idx: int) -> bytes:
+        e = self.dirs[idx]
+        if e["type"] == 2 and e["size"] < self.mini_cutoff:
+            return self._read_mini_stream(e["start"], e["size"])
+        return self._read_big_stream(e["start"], e["size"])
+
+
+def decode_msg_string(b: bytes) -> str:
+    if not b:
+        return ""
+    for enc in ("utf-16le", "utf-8", "latin1"):
+        try:
+            return clean_text(b.decode(enc, "ignore").replace("\x00", ""))
+        except Exception:
+            pass
+    return ""
+
+
+def read_msg_bytes(data: bytes, filename: str) -> Tuple[str, str, List[Tuple[str, bytes]]]:
+    subject, body = "", ""
+    attachments: List[Tuple[str, bytes]] = []
+
+    # Preferred library path when available.
+    if extract_msg is not None:
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".msg") as tmp:
+                tmp.write(data)
+                msg_path = tmp.name
+            try:
+                msg = extract_msg.Message(msg_path)
+                subject = clean_text(getattr(msg, "subject", "") or filename)
+                body = clean_text(getattr(msg, "body", "") or "")
+                for att in getattr(msg, "attachments", []) or []:
+                    name = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or "attachment"
+                    att_data = getattr(att, "data", None)
+                    if callable(att_data):
+                        att_data = att_data()
+                    if isinstance(att_data, bytes):
+                        attachments.append((name, att_data))
+            finally:
+                try:
+                    os.remove(msg_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Robust fallback: parse OLE streams directly.
+    if not subject or not attachments:
+        cfb = CFB(data)
+        names: Dict[str, str] = {}
+        bins: Dict[str, bytes] = {}
+        for idx, path, e in cfb.walk():
+            if e["type"] != 2:
+                continue
+            sname = path.split("/")[-1]
+            raw = cfb.read_stream(idx)
+            if sname == "__substg1.0_0037001F":
+                subject = subject or decode_msg_string(raw)
+            elif sname in ("__substg1.0_1000001F", "__substg1.0_1000001E"):
+                body = body or decode_msg_string(raw)
+            elif "/__attach_version1.0_" in path:
+                base = path.split("/__substg1.0_")[0]
+                if sname in ("__substg1.0_3707001F", "__substg1.0_3704001F"):
+                    names[base] = decode_msg_string(raw) or names.get(base, "attachment")
+                elif sname == "__substg1.0_37010102":
+                    bins[base] = raw
+        for base, b in bins.items():
+            attachments.append((names.get(base, "attachment"), b))
+
+    return subject or filename, body, attachments
+
+
+def pdf_bytes_to_text(pdf_bytes: bytes) -> str:
+    if PdfReader is None:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages = []
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+        return clean_text("\n".join(pages))
+    except Exception:
+        return ""
+
+# ------------------------- Voelker PDF parser -------------------------
+
 def parse_city_state_zip(line: str) -> Tuple[str, str, str, str]:
     line = clean_text(line).replace(",", " ")
     m = re.search(rf"(.+?)\s+({STATE_RE})\s+(\d{{5}})(?:-\d{{4}})?\b", line, re.I)
@@ -125,160 +274,261 @@ def parse_city_state_zip(line: str) -> Tuple[str, str, str, str]:
     return "", "", "", ""
 
 
-def parse_address_block(text: str) -> Dict[str, str]:
-    """Prefer Ship To. Fallback to Sold To/Bill To/Customer blocks."""
-    out = {"Company": "", "Address": "", "City": "", "State": "", "ZipCode": "", "Country": "", "County": ""}
-    patterns = [
-        r"Ship\s*To\s*:?\s*(.*?)(?:\n\s*(?:Bill\s*To|Sold\s*To|Quote\s*Details|Line|Item|Description|Subtotal|Total)\b)",
-        r"SHIP\s*TO\s*:?\s*(.*?)(?:\n\s*(?:BILL\s*TO|SOLD\s*TO|QUOTE|LINE|ITEM|DESCRIPTION|SUBTOTAL|TOTAL)\b)",
-        r"Customer\s*:?\s*(.*?)(?:\n\s*(?:Quote|Line|Item|Description|Subtotal|Total)\b)",
-    ]
-    block = ""
-    for pat in patterns:
-        m = re.search(pat, text, re.I | re.S)
-        if m:
-            block = clean_text(m.group(1))
-            break
-    if not block:
-        return out
-
-    lines = [clean_text(x) for x in block.splitlines() if clean_text(x)]
-    lines = [x for x in lines if not re.search(r"^(ship to|bill to|sold to|attn|phone|fax|email)\b", x, re.I)]
-
-    csz_idx = None
+def find_after_label(lines: List[str], label: str) -> str:
     for i, line in enumerate(lines):
-        city, state, zip_code, country = parse_city_state_zip(line)
-        if city:
-            csz_idx = i
-            out.update({"City": city, "State": state, "ZipCode": zip_code, "Country": country})
-            break
-
-    if csz_idx is not None:
-        if csz_idx >= 2:
-            out["Company"] = lines[0]
-            out["Address"] = lines[1]
-        elif csz_idx == 1:
-            out["Address"] = lines[0]
-        if not out["Country"] and csz_idx + 1 < len(lines):
-            if re.search(r"united states|usa|u\.s\.a", lines[csz_idx + 1], re.I):
-                out["Country"] = "USA"
-    return out
+        if re.fullmatch(label, line, re.I):
+            for j in range(i + 1, min(i + 8, len(lines))):
+                val = clean_text(lines[j])
+                if val and not re.fullmatch(r"Page|Salesperson|Cust #|Terms|Quantity|Quoted By|Ship Via|Ppd/Col|Shipped From", val, re.I):
+                    return val
+    return ""
 
 
-def parse_header(subject: str, text: str, filename: str) -> Dict[str, str]:
-    d = {}
-    all_text = subject + "\n" + text + "\n" + filename
+def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
+    text = clean_text(pdf_text)
+    lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
+    joined = "\n".join(lines)
 
-    d["QuoteNumber"] = get_regex(r"Quote\s*#?\s*[:\-]?\s*(\d+)", all_text) or get_regex(r"#\s*(\d{5,})", all_text)
-    d["Company"] = get_regex(r"Customer\s*[:\-]\s*([^\n\r]+)", all_text) or get_regex(r"Customer_\s*([^\.]+)", filename)
-    d["QuoteDate"] = get_regex(r"Quote\s*Date\s*[:\-]?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})", text)
-    d["QuoteExpiration"] = get_regex(r"(?:Expiration|Expires|Valid\s*Until|Quote\s*Expiration)\s*[:\-]?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})", text)
-    d["CustomerNumber"] = get_regex(r"(?:Cust(?:omer)?\s*#|Customer\s*No\.?|Cust\s*No\.?)\s*[:\-]?\s*([A-Z0-9\-]+)", text)
-    d["ReferralManager"] = get_regex(r"Salesperson\s*[:\-]?\s*([^\n\r]+)", text) or get_regex(r"Sales\s*Person\s*[:\-]?\s*([^\n\r]+)", text)
-    d["Created_By"] = get_regex(r"Quoted\s*By\s*[:\-]?\s*([^\n\r]+)", text) or get_regex(r"Quote\s*Prepared\s*By\s*[:\-]?\s*([^\n\r]+)", text)
-    d["ContactEmail"] = get_regex(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", text)
-    d["ContactPhone"] = get_regex(r"(?:Phone|Tel)\s*[:\-]?\s*(\(?\d{3}\)?[\s\.-]?\d{3}[\s\.-]?\d{4})", text)
+    d = {col: "" for col in TEMPLATE_COLUMNS}
+    d["ReferralEmail"] = ""
+    d["DemoQuote"] = "No"
+    d["Country"] = "USA"
 
-    contact = get_regex(r"(?:Contact|Attention|Attn)\s*[:\-]?\s*([^\n\r]+)", text)
-    d["FirstName"], d["LastName"] = split_name(contact)
-    d["PDF"] = f"Voelker_Quote_{d['QuoteNumber']}.pdf" if d.get("QuoteNumber") else ""
+    d["QuoteNumber"] = get_regex(r"\b\d{2}/(\d{5,})\b", joined) or get_regex(r"Quote\s*#\s*(\d{5,})", fallback_subject)
+
+    date_candidates = re.findall(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", joined)
+    if date_candidates:
+        d["QuoteDate"] = date_candidates[0]
+    if len(date_candidates) > 1:
+        d["QuoteExpiration"] = date_candidates[1]
+
+    subj_company = get_regex(r"Customer[:_]\s*(.+?)(?:\.msg)?$", fallback_subject) or get_regex(r"Customer_\s*([^\.]+)", fallback_subject)
+    if subj_company:
+        d["Company"] = subj_company
+
+    # pypdf often puts the header in two compact lines:
+    # 6/23/26 7/23/26 AUTHORIZATION Salesperson Cust# Terms
+    # 01/133832 QuotedBy ShipVia Ppd/Col ShippedFrom
+    m = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+(.+?)\s+([A-Z0-9-]{2,})\s+(?:NET|CASH|DUE|COD|PREPAID)", joined, re.I)
+    if m:
+        d["QuoteDate"] = m.group(1)
+        d["QuoteExpiration"] = m.group(2)
+        middle = clean_text(m.group(3))
+        parts = middle.split()
+        # Authorization is commonly 2 words; salesperson is the remaining name before cust #.
+        if len(parts) >= 4:
+            d["ReferralManager"] = " ".join(parts[-2:])
+        else:
+            d["ReferralManager"] = middle
+        d["CustomerNumber"] = m.group(4)
+
+    m = re.search(r"\b\d{2}/\d{5,}\s+([A-Za-z]+\s+[A-Za-z]+)", joined)
+    if m:
+        d["Created_By"] = clean_text(m.group(1))
+
+    # Fallbacks for alternate text extraction order.
+    d["ReferralManager"] = d["ReferralManager"] or find_after_label(lines, r"Salesperson")
+    d["CustomerNumber"] = d["CustomerNumber"] or find_after_label(lines, r"Cust #")
+    d["Created_By"] = d["Created_By"] or find_after_label(lines, r"Quoted By")
+
+    # Ship-to: in these Voelker PDFs, the customer block appears twice (Sold To then Ship To). Use the last match.
+    company = re.escape(d["Company"]) if d["Company"] else r"[A-Z0-9 &\-.,]+"
+    addr_matches = list(re.finditer(rf"({company})\s*\n([^\n]+)\s*\n([^\n]*\b(?:{STATE_RE})\s+\d{{5}}(?:-\d{{4}})?\b)", joined, re.I))
+    if addr_matches:
+        m = addr_matches[-1]
+        d["Company"] = clean_text(m.group(1))
+        d["Address"] = clean_text(m.group(2))
+        city, state, z, country = parse_city_state_zip(m.group(3))
+        d["City"], d["State"], d["ZipCode"], d["Country"] = city, state, z, country
+
+    # More robust ship-to fallback: find the last company occurrence, then the city/state/zip line after it.
+    if d["Company"] and not d["Address"]:
+        idxs = [i for i, line in enumerate(lines) if line.upper() == d["Company"].upper()]
+        if idxs:
+            start_i = idxs[-1]
+            for j in range(start_i + 1, min(start_i + 8, len(lines))):
+                city, state, z, country = parse_city_state_zip(lines[j])
+                if city:
+                    d["City"], d["State"], d["ZipCode"], d["Country"] = city, state, z, country
+                    # Use previous line as address unless it is an ATTN/accounting note; otherwise step back once more.
+                    prev = lines[j - 1] if j - 1 > start_i else ""
+                    if re.search(r"ATTN|ACCOUNTS PAYABLE|PLANT", prev, re.I) and j - 2 > start_i:
+                        prev = lines[j - 2]
+                    d["Address"] = prev
+                    break
+
     return {k: clean_text(v) for k, v in d.items()}
 
-
-def extract_html_table_rows(html: str) -> List[List[str]]:
-    rows = []
-    if not html:
-        return rows
-    soup = BeautifulSoup(html, "lxml")
-    for tr in soup.find_all("tr"):
-        cells = [clean_text(c.get_text(" ")) for c in tr.find_all(["td", "th"])]
-        cells = [c for c in cells if c]
-        if cells:
-            rows.append(cells)
-    return rows
-
-
-def parse_line_items(text: str, html: str) -> List[Dict[str, str]]:
+def parse_items_from_pdf(pdf_text: str) -> List[Dict[str, str]]:
+    text = clean_text(pdf_text)
+    lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
+    joined = "\n".join(lines)
     items: List[Dict[str, str]] = []
 
-    # HTML table path: find rows containing qty and money values.
-    for cells in extract_html_table_rows(html):
-        joined = " | ".join(cells)
-        if not re.search(r"\$|\d+\.\d{2}", joined):
-            continue
-        if re.search(r"subtotal|tax|freight|shipping|grand total|total due", joined, re.I):
-            continue
-        money_vals = [c for c in cells if re.search(r"\$?\s*\d[\d,]*\.\d{2}", c)]
-        qty_vals = [c for c in cells if re.fullmatch(r"\d+(?:\.\d+)?", c)]
-        if len(money_vals) >= 1 and qty_vals:
-            line_no = cells[0] if re.fullmatch(r"\d+", cells[0]) else ""
-            qty = qty_vals[0]
-            total = money_vals[-1]
-            unit = money_vals[-2] if len(money_vals) >= 2 else ""
-            item_id = ""
-            desc_parts = []
-            for c in cells:
-                if c in money_vals or c in qty_vals or c == line_no:
-                    continue
-                if not item_id and re.search(r"[A-Z0-9][A-Z0-9\-_/]{2,}", c, re.I):
-                    item_id = c
-                else:
-                    desc_parts.append(c)
-            if item_id or desc_parts:
-                items.append({
-                    "quote_line_no": line_no,
-                    "item_id": item_id,
-                    "item_desc": clean_text(" ".join(desc_parts)),
-                    "Quantity": qty_to_number(qty),
-                    "UnitSales": money_to_float(unit),
-                    "TotalSales": money_to_float(total),
-                })
+    csz_indexes = [i for i, line in enumerate(lines) if parse_city_state_zip(line)[0]]
+    # Pick the ship-to city/state/zip that is actually followed by line-item details.
+    start = (csz_indexes[-1] + 1) if csz_indexes else 0
+    for idx in csz_indexes:
+        # The actual ship-to block is followed immediately by quantity or compact qty+item.
+        nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+        nxt2 = lines[idx + 2] if idx + 2 < len(lines) else ""
+        if re.match(r"^(\d+(?:\.\d+)?)(?:\s+[A-Z0-9])?", nxt, re.I):
+            start = idx + 1
+            break
+        if nxt.upper() not in ("", "PAGE", "QUOTE") and re.match(r"^\d+(?:\.\d+)?\s+[A-Z0-9][A-Z0-9_./-]*-", nxt2, re.I):
+            start = idx + 2
+            break
 
-    if items:
-        return items
+    detail_lines = []
+    for line in lines[start:]:
+        if re.match(r"^(DELIVERY:|DELIVERIS|Goods in this quote/order|Unit Price|SubTotal|Freight|Sales Tax|Quote Total|Total Tariffs|\*\*Continued\*\*)", line, re.I):
+            break
+        if re.match(r"^\d[\d,]*\.\d{2,4}(?:\s+EA\s+\d[\d,]*\.\d{2})?$", line, re.I):
+            break
+        detail_lines.append(line)
+    detail_lines = [x for x in detail_lines if not re.fullmatch(r"Page|QUOTE|Voelker Controls Company", x, re.I)]
 
-    # Plain text fallback.
-    for line in text.splitlines():
-        l = clean_text(line)
-        if len(l) < 15 or re.search(r"subtotal|tax|freight|shipping|grand total|total due", l, re.I):
+    # Price extraction independent of quantity detection.
+    after_detail = lines[start + len(detail_lines):]
+    unit_prices: List[str] = []
+    ext_prices: List[str] = []
+    nums_before_ea: List[str] = []
+    nums_after_ea: List[str] = []
+    seen_ea = False
+    for line in after_detail:
+        if re.fullmatch(r"EA", line, re.I):
+            seen_ea = True
             continue
-        m = re.match(r"^(\d+)\s+([A-Z0-9][A-Z0-9\-_/\.]+)\s+(.+?)\s+(\d+(?:\.\d+)?)\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})$", l, re.I)
+        if re.match(r"^(SubTotal|Freight|Sales Tax|Quote Total|Total Tariffs|\*\*Continued\*\*|Page|QUOTE)", line, re.I) and nums_after_ea:
+            break
+        if re.fullmatch(r"\d[\d,]*\.\d{2,4}", line):
+            if not seen_ea:
+                nums_before_ea.append(line)
+            elif len(nums_after_ea) < len(nums_before_ea):
+                nums_after_ea.append(line)
+    unit_prices = nums_before_ea
+    ext_prices = nums_after_ea
+
+    mp_all = re.findall(r"\b([\d,]+\.\d{2,4})\s+EA\s+([\d,]+\.\d{2})\b", joined, re.I)
+    if mp_all and (not unit_prices or not ext_prices):
+        unit_prices = [a for a, _ in mp_all]
+        ext_prices = [b for _, b in mp_all]
+
+    item_count_hint = max(len(unit_prices), len(ext_prices), len(mp_all))
+
+    # Quantity prefix is limited by item count hint so numeric-only item codes are not mistaken for quantities.
+    qtys = []
+    pos = 0
+    while pos < len(detail_lines) and re.fullmatch(r"\d+(?:\.\d+)?", detail_lines[pos]):
+        if item_count_hint and len(qtys) >= item_count_hint:
+            break
+        qtys.append(detail_lines[pos])
+        pos += 1
+    product_lines = detail_lines[pos:]
+    product_lines = [x for x in product_lines if not re.match(r"QC\s*QUOTE#", x, re.I)]
+
+    def looks_like_code(s: str) -> bool:
+        s = clean_text(s)
+        if not s or len(s) > 40 or '"' in s:
+            return False
+        if re.search(r"DELIVERY|FREIGHT|QUOTE DOES NOT|Incoming|Outgoing|Pallet|BLACK DIMPLE", s, re.I):
+            return False
+        if re.fullmatch(r"\d{3,6}", s):
+            return True
+        if "-" in s:
+            return True
+        if re.match(r"^1515\s+X\s+", s, re.I):
+            return True
+        return False
+
+    parsed_products: List[Tuple[str, str]] = []
+
+    # Compact first product line: "2 AE4-..." or "1 K-00027".
+    compact_qtys = []
+    compact_lines = []
+    for line in product_lines:
+        m = re.match(r"^(\d+(?:\.\d+)?)\s+([A-Z0-9][A-Z0-9\-_/\.]{2,})$", line, re.I)
         if m:
-            items.append({
-                "quote_line_no": m.group(1),
-                "item_id": m.group(2),
-                "item_desc": clean_text(m.group(3)),
-                "Quantity": qty_to_number(m.group(4)),
-                "UnitSales": money_to_float(m.group(5)),
-                "TotalSales": money_to_float(m.group(6)),
-            })
+            compact_qtys.append(m.group(1))
+            compact_lines.append(m.group(2))
+        else:
+            compact_lines.append(line)
+    if compact_qtys and not qtys:
+        qtys = compact_qtys
+        product_lines = compact_lines
+
+    # Use simple pairs only when the even lines look like item codes and odd lines look like descriptions.
+    n_hint = item_count_hint or len(qtys)
+    if n_hint and len(product_lines) >= n_hint * 2:
+        can_pair = True
+        for i in range(n_hint):
+            if not looks_like_code(product_lines[2 * i]):
+                can_pair = False
+                break
+        if can_pair:
+            for i in range(n_hint):
+                parsed_products.append((product_lines[2 * i], product_lines[2 * i + 1]))
+
+    if not parsed_products:
+        current_code = ""
+        current_desc: List[str] = []
+        for line in product_lines:
+            if looks_like_code(line) and (not current_code or len(parsed_products) + 1 < max(n_hint, 1)):
+                if current_code:
+                    parsed_products.append((current_code, " ".join(current_desc)))
+                current_code = line
+                current_desc = []
+            else:
+                current_desc.append(line)
+        if current_code:
+            parsed_products.append((current_code, " ".join(current_desc)))
+
+    n = max(len(parsed_products), len(qtys), len(unit_prices), len(ext_prices))
+    for i in range(n):
+        code = parsed_products[i][0] if i < len(parsed_products) else ""
+        desc = parsed_products[i][1] if i < len(parsed_products) else ""
+        items.append({
+            "quote_line_no": i + 1,
+            "item_id": code,
+            "item_desc": clean_text(desc),
+            "Quantity": qty_to_number(qtys[i]) if i < len(qtys) else "",
+            "UnitSales": money_to_float(unit_prices[i]) if i < len(unit_prices) else "",
+            "TotalSales": money_to_float(ext_prices[i]) if i < len(ext_prices) else "",
+        })
+
+    if not items:
+        items.append({"quote_line_no": 1, "QuoteComment": "Line item not detected - review PDF manually."})
     return items
 
+def parse_one_uploaded_msg(uploaded_file) -> List[Dict[str, str]]:
+    data = uploaded_file.getvalue()
+    subject, body, attachments = read_msg_bytes(data, uploaded_file.name)
 
-def parse_one_msg(uploaded_file) -> List[Dict[str, str]]:
-    subject, body, html, attachments = read_msg(uploaded_file)
-    text = clean_text(body + "\n" + html_to_text(html))
-    header = parse_header(subject, text, uploaded_file.name)
-    address = parse_address_block(text)
-    for k, v in address.items():
-        if v:
-            header[k] = v
-    if not header.get("Company"):
-        header["Company"] = address.get("Company", "")
+    pdfs = [(name, b) for name, b in attachments if b[:5] == b"%PDF-" or name.lower().endswith(".pdf")]
+    if not pdfs:
+        raise RuntimeError("No PDF attachment found inside MSG.")
 
-    rows = []
-    line_items = parse_line_items(text, html)
-    if not line_items:
-        line_items = [{"QuoteComment": "No line items detected - review manually."}]
+    all_rows = []
+    for pdf_name, pdf_bytes in pdfs:
+        pdf_text = pdf_bytes_to_text(pdf_bytes)
+        if not pdf_text:
+            raise RuntimeError(f"Could not read PDF text from {pdf_name}. Make sure pypdf is installed.")
+        header = parse_pdf_text(pdf_text, subject)
+        header["PDF"] = pdf_name if pdf_name.lower().endswith(".pdf") else f"Quote_{header.get('QuoteNumber','')}.pdf"
 
-    for item in line_items:
-        row = {col: "" for col in TEMPLATE_COLUMNS}
-        row.update(header)
-        row.update(item)
-        row["DemoQuote"] = "No"
-        row["cust_type"] = ""
-        rows.append(row)
-    return rows
+        # Extract contact email/phone from email body if present.
+        if body:
+            header["ContactEmail"] = get_regex(r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})", body)
+            phone = get_regex(r"(?:Phone|Tel|Cell|Mobile)\s*[:\-]?\s*(\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4})", body)
+            header["ContactPhone"] = normalize_us_phone(phone)
+
+        for item in parse_items_from_pdf(pdf_text):
+            row = {col: "" for col in TEMPLATE_COLUMNS}
+            row.update(header)
+            row.update(item)
+            row["DemoQuote"] = "No"
+            all_rows.append(row)
+    return all_rows
 
 
 def write_output(template_file, rows: List[Dict[str, str]]) -> bytes:
@@ -289,9 +539,8 @@ def write_output(template_file, rows: List[Dict[str, str]]) -> bytes:
     df_new = df_new[TEMPLATE_COLUMNS]
 
     if template_file is not None:
-        template_bytes = template_file.getvalue()
         try:
-            base = pd.read_excel(io.BytesIO(template_bytes), dtype=str)
+            base = pd.read_excel(io.BytesIO(template_file.getvalue()), dtype=str)
             columns = list(base.columns) if len(base.columns) else TEMPLATE_COLUMNS
         except Exception:
             columns = TEMPLATE_COLUMNS
@@ -312,17 +561,17 @@ def write_output(template_file, rows: List[Dict[str, str]]) -> bytes:
             cell.font = cell.font.copy(bold=True)
         for col_cells in ws.columns:
             max_len = max(len(str(c.value or "")) for c in col_cells[:100])
-            ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 10), 38)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 10), 42)
     return out.getvalue()
 
-
+# ------------------------- UI -------------------------
 with st.sidebar:
     st.header("Upload")
     msg_files = st.file_uploader("Voelker .msg files", type=["msg"], accept_multiple_files=True)
     template_file = st.file_uploader("Volkr.xlsx template", type=["xlsx"])
 
-if extract_msg is None:
-    st.error("Missing dependency: extract-msg. Add it to requirements.txt and redeploy.")
+if PdfReader is None:
+    st.error("Missing dependency: pypdf. Add pypdf to requirements.txt and redeploy.")
 
 if msg_files:
     if st.button("Extract Voelker Quotes", type="primary"):
@@ -331,15 +580,15 @@ if msg_files:
         progress = st.progress(0)
         for i, f in enumerate(msg_files, start=1):
             try:
-                all_rows.extend(parse_one_msg(f))
+                all_rows.extend(parse_one_uploaded_msg(f))
             except Exception as e:
                 errors.append(f"{f.name}: {e}")
             progress.progress(i / len(msg_files))
 
         if all_rows:
             df_preview = pd.DataFrame(all_rows)
-            st.success(f"Extracted {len(all_rows)} quote line rows from {len(msg_files)} email(s).")
-            st.dataframe(df_preview[TEMPLATE_COLUMNS], use_container_width=True)
+            st.success(f"Extracted {len(all_rows)} quote line row(s) from {len(msg_files)} email(s).")
+            st.dataframe(df_preview[[c for c in TEMPLATE_COLUMNS if c in df_preview.columns]], use_container_width=True)
             output = write_output(template_file, all_rows)
             st.download_button(
                 "Download completed Volkr output",
@@ -347,8 +596,10 @@ if msg_files:
                 file_name=f"voelker_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+        else:
+            st.error("No rows extracted. See errors below.")
         if errors:
-            st.warning("Some files need manual review:")
+            st.warning("Files needing review:")
             for err in errors:
                 st.write("- " + err)
 else:

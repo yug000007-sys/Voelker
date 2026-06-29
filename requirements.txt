@@ -1,6 +1,5 @@
 streamlit
 pandas
 openpyxl
+pypdf
 extract-msg
-beautifulsoup4
-lxml
