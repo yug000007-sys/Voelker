@@ -33,6 +33,23 @@ TEMPLATE_COLUMNS = [
 ]
 
 STATE_RE = r"AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY"
+STATE_NAME_TO_ABBR = {
+    "ALABAMA":"AL","ALASKA":"AK","ARIZONA":"AZ","ARKANSAS":"AR","CALIFORNIA":"CA","COLORADO":"CO",
+    "CONNECTICUT":"CT","DELAWARE":"DE","FLORIDA":"FL","GEORGIA":"GA","IDAHO":"ID","ILLINOIS":"IL",
+    "INDIANA":"IN","IOWA":"IA","KANSAS":"KS","KENTUCKY":"KY","LOUISIANA":"LA","MAINE":"ME","MARYLAND":"MD",
+    "MASSACHUSETTS":"MA","MICHIGAN":"MI","MINNESOTA":"MN","MISSISSIPPI":"MS","MISSOURI":"MO","MONTANA":"MT",
+    "NEBRASKA":"NE","NEVADA":"NV","NEW HAMPSHIRE":"NH","NEW JERSEY":"NJ","NEW MEXICO":"NM","NEW YORK":"NY",
+    "NORTH CAROLINA":"NC","NORTH DAKOTA":"ND","OHIO":"OH","OKLAHOMA":"OK","OREGON":"OR","PENNSYLVANIA":"PA",
+    "RHODE ISLAND":"RI","SOUTH CAROLINA":"SC","SOUTH DAKOTA":"SD","TENNESSEE":"TN","TEXAS":"TX","UTAH":"UT",
+    "VERMONT":"VT","VIRGINIA":"VA","WASHINGTON":"WA","WEST VIRGINIA":"WV","WISCONSIN":"WI","WYOMING":"WY"
+}
+REFERRAL_EMAILS = {
+    "Adam Frost": "frosa00@voelker-controls.com",
+    "Carlos De Los Santos": "deloc00@voelker-controls.com",
+    "Bryan Steller": "Stelb00@Voelker-Controls.Com",
+    "Russell Hahn": "hahnr00@voelker-controls.com",
+}
+KNOWN_SALESPEOPLE = sorted(REFERRAL_EMAILS.keys() | {"Rob McCullough", "Sean Kelly"}, key=len, reverse=True)
 
 # ------------------------- Basic helpers -------------------------
 
@@ -271,8 +288,63 @@ def parse_city_state_zip(line: str) -> Tuple[str, str, str, str]:
     m = re.search(rf"(.+?)\s+({STATE_RE})\s+(\d{{5}})(?:-\d{{4}})?\b", line, re.I)
     if m:
         return clean_text(m.group(1)), m.group(2).upper(), m.group(3), "USA"
+    # Some Sold To blocks print the full state name, e.g. PATASKALA, OHIO 43062.
+    m = re.search(r"(.+?)\s+([A-Z][A-Z ]{2,})\s+(\d{5})(?:-\d{4})?\b", line, re.I)
+    if m:
+        state_name = clean_text(m.group(2)).upper()
+        if state_name in STATE_NAME_TO_ABBR:
+            return clean_text(m.group(1)), STATE_NAME_TO_ABBR[state_name], m.group(3), "USA"
     return "", "", "", ""
 
+
+def split_auth_salesperson(value: str) -> Tuple[str, str]:
+    """Voelker header can merge Authorization + Salesperson into one string.
+    Return (authorization, salesperson), keeping ReferralManager as salesperson only.
+    """
+    value = clean_text(value)
+    if not value:
+        return "", ""
+    for sp in KNOWN_SALESPEOPLE:
+        if re.search(rf"\b{re.escape(sp)}\b", value, re.I):
+            auth = clean_text(re.sub(rf"\b{re.escape(sp)}\b", "", value, flags=re.I))
+            return title_case_company(auth), sp
+    # Generic fallback: ALL CAPS authorization followed by Title Case salesperson.
+    m = re.match(r"^([A-Z][A-Z .'-]+?)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)$", value)
+    if m:
+        return title_case_company(m.group(1)), clean_text(m.group(2))
+    return "", value
+
+
+def extract_sold_to(lines: List[str], company: str) -> Dict[str, str]:
+    """Return first/Sold To address block, not Ship To. Handles multi-line addresses."""
+    out = {"Company": company, "Address": "", "City": "", "State": "", "ZipCode": "", "Country": "USA"}
+    if not company:
+        return out
+    target = company.upper().replace("  ", " ")
+    starts = [i for i, line in enumerate(lines) if line.upper().replace("  ", " ") == target]
+    if not starts:
+        return out
+    i = starts[0]
+    block = []
+    for line in lines[i+1:i+10]:
+        # Stop before the Ship To block or item section.
+        if line.upper().replace("  ", " ") == target:
+            break
+        if line.upper() in ("PAGE", "QUOTE"):
+            break
+        block.append(line)
+        if parse_city_state_zip(line)[0]:
+            break
+    for j, line in enumerate(block):
+        city, state, z, country = parse_city_state_zip(line)
+        if city:
+            addr_lines = block[:j]
+            # Manual Voelker output keeps the main mailing/street line. Include Suite/Unit lines, skip ATTN/AP notes.
+            clean_addr = [x for x in addr_lines if not re.search(r"^(ATTN|ACCOUNTS PAYABLE|DOCK DOOR|PLANT)\b", x, re.I)]
+            out["Address"] = clean_text(" ".join(clean_addr))
+            out["City"], out["State"], out["ZipCode"], out["Country"] = city, state, z, country
+            break
+    return out
 
 def find_after_label(lines: List[str], label: str) -> str:
     for i, line in enumerate(lines):
@@ -294,7 +366,7 @@ def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
     d["DemoQuote"] = "No"
     d["Country"] = "USA"
 
-    d["QuoteNumber"] = get_regex(r"\b\d{2}/(\d{5,})\b", joined) or get_regex(r"Quote\s*#\s*(\d{5,})", fallback_subject)
+    d["QuoteNumber"] = get_regex(r"\b\d{2}/(\d{5,})(?:-[A-Z0-9]+)?\b", joined) or get_regex(r"Quote\s*#\s*(\d{5,})", fallback_subject)
 
     date_candidates = re.findall(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", joined)
     if date_candidates:
@@ -316,10 +388,12 @@ def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
     if m:
         d["QuoteDate"] = m.group(1)
         d["QuoteExpiration"] = m.group(2)
-        d["ReferralManager"] = clean_text(m.group(3))
+        auth_name, salesperson = split_auth_salesperson(m.group(3))
+        d["ReferralManager"] = salesperson
+        # The manual template leaves FirstName/LastName blank, but keep the authorization name available only when user chooses to map it later.
         d["CustomerNumber"] = m.group(4)
 
-    m = re.search(r"\b\d{2}/\d{5,}\s+([A-Za-z]+\s+[A-Za-z]+)", joined)
+    m = re.search(r"\b\d{2}/\d{5,}(?:-[A-Z0-9]+)?\s+([A-Za-z]+\s+[A-Za-z]+)", joined)
     if m:
         d["Created_By"] = clean_text(m.group(1))
 
@@ -330,32 +404,13 @@ def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
 
     # Sold To: Voelker PDFs show two customer blocks: Sold To first, Ship To second.
     # The manual Voelker sheet uses Sold To, so choose the FIRST matching customer address block.
-    company = re.escape(d["Company"]) if d["Company"] else r"[A-Z0-9 &\-.,]+"
-    addr_matches = list(re.finditer(rf"({company})\s*\n([^\n]+)\s*\n([^\n]*\b(?:{STATE_RE})\s+\d{{5}}(?:-\d{{4}})?\b)", joined, re.I))
-    if addr_matches:
-        m = addr_matches[0]
-        d["Company"] = clean_text(m.group(1))
-        d["Address"] = clean_text(m.group(2))
-        city, state, z, country = parse_city_state_zip(m.group(3))
-        d["City"], d["State"], d["ZipCode"] = city, state, z
-        # Country is not printed in the Voelker Sold To block; leave blank to match manual fetch.
-        d["Country"] = ""
+    sold = extract_sold_to(lines, d["Company"])
+    for key in ["Company", "Address", "City", "State", "ZipCode", "Country"]:
+        if sold.get(key):
+            d[key] = sold[key]
 
-    # Fallback: find the first company occurrence after the quote header, then the city/state/zip line after it.
-    if d["Company"] and not d["Address"]:
-        idxs = [i for i, line in enumerate(lines) if line.upper() == d["Company"].upper()]
-        if idxs:
-            start_i = idxs[0]
-            for j in range(start_i + 1, min(start_i + 8, len(lines))):
-                city, state, z, country = parse_city_state_zip(lines[j])
-                if city:
-                    d["City"], d["State"], d["ZipCode"] = city, state, z
-                    d["Country"] = ""
-                    prev = lines[j - 1] if j - 1 > start_i else ""
-                    if re.search(r"ATTN|ACCOUNTS PAYABLE|PLANT", prev, re.I) and j - 2 > start_i:
-                        prev = lines[j - 2]
-                    d["Address"] = prev
-                    break
+    # ReferralEmail is not printed on the quote PDF; populate the known Voelker mappings used in the manual template.
+    d["ReferralEmail"] = REFERRAL_EMAILS.get(d.get("ReferralManager", ""), "")
 
     return {k: clean_text(v) for k, v in d.items()}
 
@@ -420,7 +475,7 @@ def make_summary_row(header: Dict[str, str], pdf_text: str) -> Dict[str, str]:
     row.update(header)
 
     # Manual file keeps the full quote number like 01/129486.
-    full_q = get_regex(r"\b(\d{2}/\d{5,})\b", pdf_text)
+    full_q = get_regex(r"\b(\d{2}/\d{5,})(?:-[A-Z0-9]+)?\b", pdf_text)
     if full_q:
         row["QuoteNumber"] = full_q
 
@@ -439,6 +494,7 @@ def make_summary_row(header: Dict[str, str], pdf_text: str) -> Dict[str, str]:
     for col in ["item_id", "item_desc", "Quantity", "UnitSales", "quote_line_no", "QuoteExpiration"]:
         row[col] = ""
     row["Brand"] = "Voelker Controls"
+    row["Country"] = row.get("Country") or "USA"
     row["DemoQuote"] = ""
     return row
 
@@ -596,6 +652,9 @@ def parse_one_uploaded_msg(uploaded_file, output_mode: str = "summary") -> List[
         pdf_text = pdf_bytes_to_text(pdf_bytes)
         if not pdf_text:
             raise RuntimeError(f"Could not read PDF text from {pdf_name}. Make sure pypdf is installed.")
+        # Ignore supporting drawings/spec PDFs attached alongside the quote.
+        if not re.search(r"Quote Date\s+Expires|Quote Total|Quote #", pdf_text, re.I):
+            continue
         header = parse_pdf_text(pdf_text, subject)
         header["PDF"] = pdf_name if pdf_name.lower().endswith(".pdf") else f"Quote_{header.get('QuoteNumber','')}.pdf"
 

@@ -18,6 +18,11 @@ Streamlit app for Voelker `.msg` quote emails.
 - Does not create separate line-item rows unless you select line-item mode
 - Clears item columns in summary mode
 - Formats company/address/city in readable title case
+- Fixes ReferralManager duplicate issue by separating Authorization from Salesperson
+- Populates Country as USA from Sold To block
+- Handles multi-line Sold To addresses like street + suite
+- Ignores supporting PDF drawings/specs and processes only the quote PDF
+- Handles revised quote numbers like 01/133800-R01 while outputting VOELKER_133800.pdf
 
 ## Run locally
 
