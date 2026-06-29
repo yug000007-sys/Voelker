@@ -31,3 +31,9 @@ streamlit run app.py
 1. Upload these files to GitHub
 2. In Streamlit Cloud, create a new app from the repo
 3. Main file path: `app.py`
+
+
+Notes:
+- Uses Voelker PDF attachment inside each MSG.
+- Address is taken from Sold To, not Ship To.
+- Brand is populated as Voelker Controls.

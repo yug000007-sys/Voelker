@@ -309,17 +309,14 @@ def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
     # pypdf often puts the header in two compact lines:
     # 6/23/26 7/23/26 AUTHORIZATION Salesperson Cust# Terms
     # 01/133832 QuotedBy ShipVia Ppd/Col ShippedFrom
-    m = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+(.+?)\s+([A-Z0-9-]{2,})\s+(?:NET|CASH|DUE|COD|PREPAID)", joined, re.I)
+    # Header line example:
+    # 6/23/26 7/23/26 Rob McCullough 9877 SPECIAL SEE BELOW
+    # Older parser required terms like NET/CASH and missed SPECIAL terms.
+    m = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+(.+?)\s+(\d{3,})\s+([^\n]+)", joined, re.I)
     if m:
         d["QuoteDate"] = m.group(1)
         d["QuoteExpiration"] = m.group(2)
-        middle = clean_text(m.group(3))
-        parts = middle.split()
-        # Authorization is commonly 2 words; salesperson is the remaining name before cust #.
-        if len(parts) >= 4:
-            d["ReferralManager"] = " ".join(parts[-2:])
-        else:
-            d["ReferralManager"] = middle
+        d["ReferralManager"] = clean_text(m.group(3))
         d["CustomerNumber"] = m.group(4)
 
     m = re.search(r"\b\d{2}/\d{5,}\s+([A-Za-z]+\s+[A-Za-z]+)", joined)
@@ -331,26 +328,29 @@ def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
     d["CustomerNumber"] = d["CustomerNumber"] or find_after_label(lines, r"Cust #")
     d["Created_By"] = d["Created_By"] or find_after_label(lines, r"Quoted By")
 
-    # Ship-to: in these Voelker PDFs, the customer block appears twice (Sold To then Ship To). Use the last match.
+    # Sold To: Voelker PDFs show two customer blocks: Sold To first, Ship To second.
+    # The manual Voelker sheet uses Sold To, so choose the FIRST matching customer address block.
     company = re.escape(d["Company"]) if d["Company"] else r"[A-Z0-9 &\-.,]+"
     addr_matches = list(re.finditer(rf"({company})\s*\n([^\n]+)\s*\n([^\n]*\b(?:{STATE_RE})\s+\d{{5}}(?:-\d{{4}})?\b)", joined, re.I))
     if addr_matches:
-        m = addr_matches[-1]
+        m = addr_matches[0]
         d["Company"] = clean_text(m.group(1))
         d["Address"] = clean_text(m.group(2))
         city, state, z, country = parse_city_state_zip(m.group(3))
-        d["City"], d["State"], d["ZipCode"], d["Country"] = city, state, z, country
+        d["City"], d["State"], d["ZipCode"] = city, state, z
+        # Country is not printed in the Voelker Sold To block; leave blank to match manual fetch.
+        d["Country"] = ""
 
-    # More robust ship-to fallback: find the last company occurrence, then the city/state/zip line after it.
+    # Fallback: find the first company occurrence after the quote header, then the city/state/zip line after it.
     if d["Company"] and not d["Address"]:
         idxs = [i for i, line in enumerate(lines) if line.upper() == d["Company"].upper()]
         if idxs:
-            start_i = idxs[-1]
+            start_i = idxs[0]
             for j in range(start_i + 1, min(start_i + 8, len(lines))):
                 city, state, z, country = parse_city_state_zip(lines[j])
                 if city:
-                    d["City"], d["State"], d["ZipCode"], d["Country"] = city, state, z, country
-                    # Use previous line as address unless it is an ATTN/accounting note; otherwise step back once more.
+                    d["City"], d["State"], d["ZipCode"] = city, state, z
+                    d["Country"] = ""
                     prev = lines[j - 1] if j - 1 > start_i else ""
                     if re.search(r"ATTN|ACCOUNTS PAYABLE|PLANT", prev, re.I) and j - 2 > start_i:
                         prev = lines[j - 2]
@@ -436,9 +436,10 @@ def make_summary_row(header: Dict[str, str], pdf_text: str) -> Dict[str, str]:
     row["TotalSales"] = extract_quote_total(pdf_text)
 
     # Match manual yellow row: quote-level record only.
-    for col in ["item_id", "item_desc", "Quantity", "UnitSales", "quote_line_no", "Brand", "QuoteExpiration"]:
+    for col in ["item_id", "item_desc", "Quantity", "UnitSales", "quote_line_no", "QuoteExpiration"]:
         row[col] = ""
-    row["DemoQuote"] = "No"
+    row["Brand"] = "Voelker Controls"
+    row["DemoQuote"] = ""
     return row
 
 def parse_items_from_pdf(pdf_text: str) -> List[Dict[str, str]]:
