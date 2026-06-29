@@ -21,7 +21,7 @@ except Exception:
 
 st.set_page_config(page_title="Voelker Quote Extractor", layout="wide")
 st.title("Voelker Quote Extractor")
-st.caption("Upload Voelker .msg quote emails + Volkr.xlsx template. Extracts quote data from the attached PDF inside each MSG. No API required.")
+st.caption("Upload Voelker .msg quote emails + Volkr.xlsx template. Extracts quote data from the attached PDF inside each MSG. Default output is one row per quote to match the manual Voelker template. No API required.")
 
 TEMPLATE_COLUMNS = [
     "ReferralManager", "ReferralEmail", "QuoteNumber", "QuoteDate", "Company",
@@ -359,6 +359,88 @@ def parse_pdf_text(pdf_text: str, fallback_subject: str = "") -> Dict[str, str]:
 
     return {k: clean_text(v) for k, v in d.items()}
 
+
+
+
+
+def normalize_date(value: str) -> str:
+    value = clean_text(value)
+    if not value:
+        return ""
+    for fmt in ("%m/%d/%y", "%m/%d/%Y", "%m/%-d/%y", "%-m/%d/%y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt.strftime("%m/%d/%Y")
+        except Exception:
+            pass
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{2})$", value)
+    if m:
+        return f"{int(m.group(1)):02d}/{int(m.group(2)):02d}/20{m.group(3)}"
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", value)
+    if m:
+        return f"{int(m.group(1)):02d}/{int(m.group(2)):02d}/{m.group(3)}"
+    return value
+
+def title_case_company(name: str) -> str:
+    """Make ALL CAPS customer names look like manual entry while preserving punctuation."""
+    name = clean_text(name)
+    if not name:
+        return ""
+    # Keep common short business words readable.
+    return " ".join(w.capitalize() if w.isupper() else w for w in name.split())
+
+
+def extract_quote_total(pdf_text: str) -> float:
+    """Return the final Quote Total/last total amount from the Voelker quote PDF."""
+    text = clean_text(pdf_text)
+    lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
+
+    # Best case: label followed by value in the next few lines.
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"Quote Total", line, re.I):
+            for nxt in lines[i + 1:i + 8]:
+                if re.fullmatch(r"[\d,]+\.\d{2}", nxt):
+                    return money_to_float(nxt)
+
+    # pypdf often extracts the bottom totals as several money-only lines. Quote Total is usually
+    # the last money-only amount before optional "Total Tariffs" text.
+    money_lines = []
+    for line in lines:
+        if re.fullmatch(r"[\d,]+\.\d{2}", line):
+            money_lines.append(line)
+        elif re.match(r"^(Total Tariffs|Goods in this quote/order|Page|QUOTE)$", line, re.I) and money_lines:
+            # do not reset; totals normally appear immediately before this.
+            pass
+    return money_to_float(money_lines[-1]) if money_lines else ""
+
+
+def make_summary_row(header: Dict[str, str], pdf_text: str) -> Dict[str, str]:
+    """Create one manual-style row per quote, without item details."""
+    row = {col: "" for col in TEMPLATE_COLUMNS}
+    row.update(header)
+
+    # Manual file keeps the full quote number like 01/129486.
+    full_q = get_regex(r"\b(\d{2}/\d{5,})\b", pdf_text)
+    if full_q:
+        row["QuoteNumber"] = full_q
+
+    plain_q = row.get("QuoteNumber", "")
+    if "/" in plain_q:
+        plain_q = plain_q.split("/", 1)[1]
+    row["PDF"] = f"VOELKER_{plain_q}.pdf" if plain_q else row.get("PDF", "")
+
+    row["QuoteDate"] = normalize_date(row.get("QuoteDate", ""))
+    row["Company"] = title_case_company(row.get("Company", ""))
+    row["Address"] = title_case_company(row.get("Address", ""))
+    row["City"] = title_case_company(row.get("City", ""))
+    row["TotalSales"] = extract_quote_total(pdf_text)
+
+    # Match manual yellow row: quote-level record only.
+    for col in ["item_id", "item_desc", "Quantity", "UnitSales", "quote_line_no", "Brand", "QuoteExpiration"]:
+        row[col] = ""
+    row["DemoQuote"] = "No"
+    return row
+
 def parse_items_from_pdf(pdf_text: str) -> List[Dict[str, str]]:
     text = clean_text(pdf_text)
     lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
@@ -500,7 +582,7 @@ def parse_items_from_pdf(pdf_text: str) -> List[Dict[str, str]]:
         items.append({"quote_line_no": 1, "QuoteComment": "Line item not detected - review PDF manually."})
     return items
 
-def parse_one_uploaded_msg(uploaded_file) -> List[Dict[str, str]]:
+def parse_one_uploaded_msg(uploaded_file, output_mode: str = "summary") -> List[Dict[str, str]]:
     data = uploaded_file.getvalue()
     subject, body, attachments = read_msg_bytes(data, uploaded_file.name)
 
@@ -522,12 +604,15 @@ def parse_one_uploaded_msg(uploaded_file) -> List[Dict[str, str]]:
             phone = get_regex(r"(?:Phone|Tel|Cell|Mobile)\s*[:\-]?\s*(\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4})", body)
             header["ContactPhone"] = normalize_us_phone(phone)
 
-        for item in parse_items_from_pdf(pdf_text):
-            row = {col: "" for col in TEMPLATE_COLUMNS}
-            row.update(header)
-            row.update(item)
-            row["DemoQuote"] = "No"
-            all_rows.append(row)
+        if output_mode == "summary":
+            all_rows.append(make_summary_row(header, pdf_text))
+        else:
+            for item in parse_items_from_pdf(pdf_text):
+                row = {col: "" for col in TEMPLATE_COLUMNS}
+                row.update(header)
+                row.update(item)
+                row["DemoQuote"] = "No"
+                all_rows.append(row)
     return all_rows
 
 
@@ -569,6 +654,12 @@ with st.sidebar:
     st.header("Upload")
     msg_files = st.file_uploader("Voelker .msg files", type=["msg"], accept_multiple_files=True)
     template_file = st.file_uploader("Volkr.xlsx template", type=["xlsx"])
+    output_mode = st.radio(
+        "Output style",
+        ["summary", "line_items"],
+        index=0,
+        format_func=lambda x: "One row per quote (matches manual yellow)" if x == "summary" else "Line item rows",
+    )
 
 if PdfReader is None:
     st.error("Missing dependency: pypdf. Add pypdf to requirements.txt and redeploy.")
@@ -580,7 +671,7 @@ if msg_files:
         progress = st.progress(0)
         for i, f in enumerate(msg_files, start=1):
             try:
-                all_rows.extend(parse_one_uploaded_msg(f))
+                all_rows.extend(parse_one_uploaded_msg(f, output_mode=output_mode))
             except Exception as e:
                 errors.append(f"{f.name}: {e}")
             progress.progress(i / len(msg_files))

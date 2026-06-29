@@ -1,14 +1,23 @@
 # Voelker Quote Extractor
 
-Streamlit app for extracting Voelker quote data from Outlook `.msg` emails.
+Streamlit app for Voelker `.msg` quote emails.
 
 ## What it does
 
-- Upload one or more Voelker `.msg` files.
-- Upload `Volkr.xlsx` as the template.
-- The app reads the PDF quote attached inside each MSG.
-- It extracts quote header, ship-to details, item, quantity, unit price, total, salesperson, quoted by, customer number, quote date, and expiration.
-- Download the completed Excel file.
+- Upload one or more Voelker Outlook `.msg` files
+- Reads the attached quote PDF inside each email
+- Extracts quote-level fields into the Volkr template
+- Default output matches the manual/yellow row style: **one row per quote**
+- Optional line-item mode is available from the sidebar
+
+## Main fixes in this version
+
+- Keeps full quote number format like `01/129486`
+- Creates PDF filename as `VOELKER_129486.pdf`
+- Uses quote-level `Quote Total` in `TotalSales`
+- Does not create separate line-item rows unless you select line-item mode
+- Clears item columns in summary mode
+- Formats company/address/city in readable title case
 
 ## Run locally
 
@@ -19,17 +28,6 @@ streamlit run app.py
 
 ## Deploy on Streamlit Cloud
 
-1. Create a GitHub repository.
-2. Upload these files:
-   - `app.py`
-   - `requirements.txt`
-   - `README.md`
-3. In Streamlit Cloud, select the repo and set main file path to:
-
-```text
-app.py
-```
-
-## Notes
-
-This version extracts data from the PDF attachment inside the `.msg`, not only the email body. The earlier blank output happened because the useful quote details are in the attached PDF.
+1. Upload these files to GitHub
+2. In Streamlit Cloud, create a new app from the repo
+3. Main file path: `app.py`
