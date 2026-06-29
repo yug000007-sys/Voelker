@@ -3,6 +3,7 @@ import os
 import re
 import struct
 import tempfile
+from zipfile import ZipFile
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -21,7 +22,7 @@ except Exception:
 
 st.set_page_config(page_title="Voelker Quote Extractor", layout="wide")
 st.title("Voelker Quote Extractor")
-st.caption("Upload Voelker .msg quote emails + Volkr.xlsx template. Extracts quote data from the attached PDF inside each MSG. Default output is one row per quote to match the manual Voelker template. No API required.")
+st.caption("Upload Voelker .msg quote emails + Volkr.xlsx template. Extracts quote data from the attached PDF inside each MSG. Default output is one row per quote to match the manual Voelker template. No API required. Output ZIP contains Excel + renamed PDFs; no files are permanently stored.")
 
 TEMPLATE_COLUMNS = [
     "ReferralManager", "ReferralEmail", "QuoteNumber", "QuoteDate", "Company",
@@ -713,7 +714,7 @@ def parse_items_from_pdf(pdf_text: str) -> List[Dict[str, str]]:
         items.append({"quote_line_no": 1, "QuoteComment": "Line item not detected - review PDF manually."})
     return items
 
-def parse_one_uploaded_msg(uploaded_file, output_mode: str = "summary") -> List[Dict[str, str]]:
+def parse_one_uploaded_msg(uploaded_file, output_mode: str = "summary") -> Tuple[List[Dict[str, str]], List[Tuple[str, bytes]]]:
     data = uploaded_file.getvalue()
     subject, body, attachments = read_msg_bytes(data, uploaded_file.name)
 
@@ -722,6 +723,7 @@ def parse_one_uploaded_msg(uploaded_file, output_mode: str = "summary") -> List[
         raise RuntimeError("No PDF attachment found inside MSG.")
 
     all_rows = []
+    renamed_pdfs: List[Tuple[str, bytes]] = []
     for pdf_name, pdf_bytes in pdfs:
         pdf_text = pdf_bytes_to_text(pdf_bytes)
         if not pdf_text:
@@ -739,15 +741,27 @@ def parse_one_uploaded_msg(uploaded_file, output_mode: str = "summary") -> List[
             header["ContactPhone"] = normalize_us_phone(phone)
 
         if output_mode == "summary":
-            all_rows.append(make_summary_row(header, pdf_text))
+            row = make_summary_row(header, pdf_text)
+            all_rows.append(row)
+            renamed_pdfs.append((row.get("PDF") or pdf_name or "quote.pdf", pdf_bytes))
         else:
+            quote_rows = []
             for item in parse_items_from_pdf(pdf_text):
                 row = {col: "" for col in TEMPLATE_COLUMNS}
                 row.update(header)
                 row.update(item)
                 row["DemoQuote"] = "No"
+                quote_rows.append(row)
                 all_rows.append(row)
-    return all_rows
+            pdf_out_name = quote_rows[0].get("PDF") if quote_rows else header.get("PDF")
+            # In line-item mode, still rename the quote PDF consistently.
+            q = header.get("QuoteNumber", "")
+            if q and "/" in q:
+                q = q.split("/", 1)[1]
+            if q:
+                pdf_out_name = f"VOELKER_{q}.pdf"
+            renamed_pdfs.append((pdf_out_name or pdf_name or "quote.pdf", pdf_bytes))
+    return all_rows, renamed_pdfs
 
 
 def write_output(template_file, rows: List[Dict[str, str]]) -> bytes:
@@ -783,6 +797,43 @@ def write_output(template_file, rows: List[Dict[str, str]]) -> bytes:
             ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 10), 42)
     return out.getvalue()
 
+
+
+def build_zip_package(excel_bytes: bytes, pdf_files: List[Tuple[str, bytes]]) -> bytes:
+    """Build an in-memory ZIP containing the Excel output and renamed quote PDFs.
+
+    Nothing is written to app folders; all files are kept in memory only.
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bio = io.BytesIO()
+    used = set()
+    with ZipFile(bio, "w") as z:
+        z.writestr(f"voelker_output_{ts}.xlsx", excel_bytes)
+        for name, data in pdf_files:
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or "quote.pdf").strip("_")
+            if not safe.lower().endswith(".pdf"):
+                safe += ".pdf"
+            base, ext = os.path.splitext(safe)
+            final = safe
+            n = 2
+            while final.lower() in used:
+                final = f"{base}_{n}{ext}"
+                n += 1
+            used.add(final.lower())
+            z.writestr(final, data)
+    return bio.getvalue()
+
+
+def clear_session_after_download():
+    """Clear processed output from Streamlit session after the download click.
+
+    Uploaded MSG/template bytes are never written to project storage by this app.
+    This removes the generated preview/ZIP from session memory on the next rerun.
+    """
+    for key in ["voelker_rows", "voelker_zip", "voelker_errors", "voelker_pdf_count"]:
+        if key in st.session_state:
+            del st.session_state[key]
+
 # ------------------------- UI -------------------------
 with st.sidebar:
     st.header("Upload")
@@ -801,31 +852,47 @@ if PdfReader is None:
 if msg_files:
     if st.button("Extract Voelker Quotes", type="primary"):
         all_rows = []
+        all_pdfs: List[Tuple[str, bytes]] = []
         errors = []
         progress = st.progress(0)
         for i, f in enumerate(msg_files, start=1):
             try:
-                all_rows.extend(parse_one_uploaded_msg(f, output_mode=output_mode))
+                rows, pdf_files = parse_one_uploaded_msg(f, output_mode=output_mode)
+                all_rows.extend(rows)
+                all_pdfs.extend(pdf_files)
             except Exception as e:
                 errors.append(f"{f.name}: {e}")
             progress.progress(i / len(msg_files))
 
         if all_rows:
-            df_preview = pd.DataFrame(all_rows)
-            st.success(f"Extracted {len(all_rows)} quote line row(s) from {len(msg_files)} email(s).")
-            st.dataframe(df_preview[[c for c in TEMPLATE_COLUMNS if c in df_preview.columns]], use_container_width=True)
             output = write_output(template_file, all_rows)
-            st.download_button(
-                "Download completed Volkr output",
-                data=output,
-                file_name=f"voelker_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            zip_bytes = build_zip_package(output, all_pdfs)
+            st.session_state["voelker_rows"] = all_rows
+            st.session_state["voelker_zip"] = zip_bytes
+            st.session_state["voelker_errors"] = errors
+            st.session_state["voelker_pdf_count"] = len(all_pdfs)
         else:
             st.error("No rows extracted. See errors below.")
-        if errors:
-            st.warning("Files needing review:")
-            for err in errors:
-                st.write("- " + err)
-else:
+            st.session_state["voelker_errors"] = errors
+
+if "voelker_rows" in st.session_state:
+    rows = st.session_state["voelker_rows"]
+    df_preview = pd.DataFrame(rows)
+    st.success(f"Extracted {len(rows)} row(s). ZIP includes Excel + {st.session_state.get('voelker_pdf_count', 0)} renamed quote PDF(s).")
+    st.dataframe(df_preview[[c for c in TEMPLATE_COLUMNS if c in df_preview.columns]], use_container_width=True)
+    st.download_button(
+        "Download ZIP with Excel + renamed PDFs",
+        data=st.session_state["voelker_zip"],
+        file_name=f"voelker_output_package_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+        mime="application/zip",
+        on_click=clear_session_after_download,
+    )
+    st.caption("Privacy: uploaded MSGs, extracted Excel, and PDFs are handled in memory only. Temporary MSG parser files are deleted immediately. The generated ZIP is removed from Streamlit session memory after you click download; no output files are saved in the app folder.")
+
+if st.session_state.get("voelker_errors"):
+    st.warning("Files needing review:")
+    for err in st.session_state["voelker_errors"]:
+        st.write("- " + err)
+
+if not msg_files:
     st.info("Upload one or more Voelker .msg files to start.")
